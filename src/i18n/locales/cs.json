@@ -1,0 +1,34 @@
+{
+  "nav": {
+    "browse": "Procházet",
+    "listTicket": "Vložit lístek",
+    "myListings": "Moje nabídky",
+    "watchlist": "Sledované",
+    "sellerDashboard": "Prodejní panel",
+    "ticketHistory": "Historie lístků",
+    "adminDashboard": "Administrační panel",
+    "signIn": "Přihlásit se",
+    "signOut": "Odhlásit se"
+  },
+  "hero": {
+    "title": "MinMaxValue",
+    "subtitle": "Pokerové Tržiště Lístků",
+    "description": "Kupujte a prodávejte turnajové lístky snadno. Spojte se s hráči, kteří se nemohou zúčastnit svých událostí a najděte si perfektní místo u stolu.",
+    "browseTickets": "Procházet lístky",
+    "listYourTicket": "Vložit svůj lístek"
+  },
+  "features": {
+    "simple": {
+      "title": "Jednoduché a rychlé",
+      "description": "Vložte nebo kupte lístky pomocí několika kliknutí. Náš zjednodušený proces vás dostane ke stolu rychleji."
+    },
+    "secure": {
+      "title": "Bezpečné transakce",
+      "description": "Chráněné platby a ověření prodejci zajišťují, že vaše peníze a lístky jsou v bezpečí v každém kroku."
+    },
+    "pricing": {
+      "title": "Férové ceny",
+      "description": "Tržní ceny znamenají, že prodejci získají férovou hodnotu a kupující najdou skvělé nabídky na turnajové vstupy."
+    }
+  }
+}
