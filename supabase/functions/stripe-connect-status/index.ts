@@ -46,13 +46,33 @@ serve(async (req) => {
       });
     }
 
-    // Get user's stripe account
-    const { data: stripeAccount, error: accountError } = await supabaseClient
+    // Parse request body for account type
+    let body: { account_type?: string; organization_id?: string } = {};
+    try {
+      body = await req.json();
+    } catch {
+      // No body sent, default to seller
+    }
+
+    const { account_type = "seller", organization_id } = body;
+
+    // Build query based on account type
+    let query = supabaseClient
       .from("stripe_accounts")
-      .select("*")
-      .eq("user_id", user.id)
-      .eq("account_type", "seller")
-      .maybeSingle();
+      .select("*");
+
+    if (account_type === "seller") {
+      query = query.eq("user_id", user.id).eq("account_type", "seller");
+    } else if (account_type === "organization" && organization_id) {
+      query = query.eq("organization_id", organization_id).eq("account_type", "organization");
+    } else {
+      return new Response(
+        JSON.stringify({ error: "Invalid account type or missing organization_id" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    const { data: stripeAccount, error: accountError } = await query.maybeSingle();
 
     if (accountError) {
       throw new Error("Failed to fetch Stripe account");
@@ -78,12 +98,40 @@ serve(async (req) => {
       apiVersion: "2023-10-16",
     });
 
-    const account = await stripe.accounts.retrieve(stripeAccount.stripe_account_id);
+    let account: Stripe.Account;
+    try {
+      account = await stripe.accounts.retrieve(stripeAccount.stripe_account_id);
+    } catch (stripeError: unknown) {
+      console.error("Stripe account retrieval failed:", stripeError);
+
+      // Mark as invalid in DB
+      await supabaseClient
+        .from("stripe_accounts")
+        .update({
+          onboarding_status: "invalid",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", stripeAccount.id);
+
+      return new Response(
+        JSON.stringify({
+          connected: false,
+          error: "Stripe account no longer valid",
+          needs_reconnect: true,
+        }),
+        {
+          status: 200,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
+    }
 
     // Determine onboarding status
     let onboardingStatus = stripeAccount.onboarding_status;
-    if (account.details_submitted && account.charges_enabled) {
+    if (account.details_submitted && account.charges_enabled && account.payouts_enabled) {
       onboardingStatus = "complete";
+    } else if (account.details_submitted && account.charges_enabled) {
+      onboardingStatus = "pending_payouts";
     } else if (account.details_submitted) {
       onboardingStatus = "pending_verification";
     } else {
@@ -107,6 +155,20 @@ serve(async (req) => {
         .eq("id", stripeAccount.id);
     }
 
+    // Get balance (optional but useful for dashboard)
+    let balance = null;
+    try {
+      const stripeBalance = await stripe.balance.retrieve({
+        stripeAccount: stripeAccount.stripe_account_id,
+      });
+      balance = {
+        available: stripeBalance.available,
+        pending: stripeBalance.pending,
+      };
+    } catch (e) {
+      console.log("Could not fetch balance:", e);
+    }
+
     return new Response(
       JSON.stringify({
         connected: true,
@@ -114,6 +176,8 @@ serve(async (req) => {
         onboarding_status: onboardingStatus,
         charges_enabled: account.charges_enabled,
         payouts_enabled: account.payouts_enabled,
+        details_submitted: account.details_submitted,
+        balance,
       }),
       {
         status: 200,
