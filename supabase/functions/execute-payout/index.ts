@@ -65,10 +65,24 @@ serve(async (req) => {
       });
     }
 
-    // Get payout record
+    // Get payout record with related data
     const { data: payout, error: payoutError } = await supabaseClient
       .from("payouts")
-      .select("*, user:profiles!payouts_user_id_fkey(id, email)")
+      .select(`
+        *,
+        user:profiles!payouts_user_id_fkey(id, email),
+        purchase:purchases(
+          ticket_id,
+          org_fee,
+          tickets(
+            organizations(
+              id,
+              name,
+              stripe_account_id
+            )
+          )
+        )
+      `)
       .eq("id", payout_id)
       .single();
 
@@ -86,13 +100,14 @@ serve(async (req) => {
       });
     }
 
+    // Handle decline
     if (action === "decline") {
-      // Update payout status to cancelled
       const { error: updateError } = await supabaseClient
         .from("payouts")
         .update({
           status: "cancelled",
           processed_at: new Date().toISOString(),
+          processed_by: user.id,
           notes: `Declined by admin ${user.email}`,
           updated_at: new Date().toISOString(),
         })
@@ -110,14 +125,14 @@ serve(async (req) => {
     }
 
     // Get seller's Stripe connected account
-    const { data: stripeAccount, error: accountError } = await supabaseClient
+    const { data: sellerStripeAccount, error: accountError } = await supabaseClient
       .from("stripe_accounts")
       .select("*")
       .eq("user_id", payout.user_id)
       .eq("account_type", "seller")
       .single();
 
-    if (accountError || !stripeAccount) {
+    if (accountError || !sellerStripeAccount) {
       return new Response(
         JSON.stringify({ error: "Seller has no connected Stripe account" }),
         {
@@ -127,9 +142,30 @@ serve(async (req) => {
       );
     }
 
-    if (!stripeAccount.payouts_enabled) {
+    if (!sellerStripeAccount.payouts_enabled) {
       return new Response(
         JSON.stringify({ error: "Seller's Stripe account cannot receive payouts" }),
+        {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
+    }
+
+    // Validate wallet balance
+    const { data: wallet } = await supabaseClient
+      .from("wallets")
+      .select("balance, pending_balance")
+      .eq("user_id", payout.user_id)
+      .single();
+
+    if (!wallet || wallet.balance < payout.amount) {
+      return new Response(
+        JSON.stringify({
+          error: "Insufficient wallet balance",
+          wallet_balance: wallet?.balance || 0,
+          payout_amount: payout.amount,
+        }),
         {
           status: 400,
           headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -141,70 +177,124 @@ serve(async (req) => {
       apiVersion: "2023-10-16",
     });
 
+    // Check platform balance
+    const platformBalance = await stripe.balance.retrieve();
+    const availableBalance = platformBalance.available.find(b => b.currency === "usd")?.amount || 0;
+
+    const totalTransferAmount = payout.amount + (payout.purchase?.org_fee || 0);
+
+    if (availableBalance < totalTransferAmount) {
+      return new Response(
+        JSON.stringify({
+          error: "Insufficient platform balance for payout",
+          available: availableBalance,
+          required: totalTransferAmount,
+        }),
+        {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
+    }
+
     // Mark payout as processing
     await supabaseClient
       .from("payouts")
       .update({
         status: "processing",
         processed_at: new Date().toISOString(),
+        processed_by: user.id,
         updated_at: new Date().toISOString(),
       })
       .eq("id", payout_id);
 
-    // Create Stripe transfer
-    const transfer = await stripe.transfers.create({
-      amount: payout.amount,
-      currency: "usd",
-      destination: stripeAccount.stripe_account_id,
-      description: `Payout for user ${payout.user_id}`,
-      metadata: {
-        payout_id: payout.id,
-        user_id: payout.user_id,
-      },
-    });
-
-    // Create stripe_payouts record
-    const { error: stripePayoutError } = await supabaseClient
-      .from("stripe_payouts")
-      .insert({
-        stripe_transfer_id: transfer.id,
-        seller_id: payout.user_id,
-        payout_id: payout.id,
+    try {
+      // 1. Transfer to SELLER
+      const sellerTransfer = await stripe.transfers.create({
         amount: payout.amount,
-        currency: "USD",
-        status: "completed",
-        admin_approved: true,
-        approved_by: user.id,
-        approved_at: new Date().toISOString(),
+        currency: "usd",
+        destination: sellerStripeAccount.stripe_account_id,
+        description: `Payout for ticket sale`,
+        metadata: {
+          payout_id: payout.id,
+          user_id: payout.user_id,
+          type: "seller_payout",
+        },
+      }, {
+        idempotencyKey: `seller_payout_${payout.id}`,
       });
 
-    if (stripePayoutError) {
-      console.error("Error creating stripe_payouts record:", stripePayoutError);
-    }
+      // Record seller payout
+      await supabaseClient
+        .from("stripe_payouts")
+        .insert({
+          stripe_transfer_id: sellerTransfer.id,
+          seller_id: payout.user_id,
+          payout_id: payout.id,
+          amount: payout.amount,
+          currency: "USD",
+          status: "completed",
+          payout_type: "seller",
+          admin_approved: true,
+          approved_by: user.id,
+          approved_at: new Date().toISOString(),
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        });
 
-    // Update payout as completed
-    const { error: completeError } = await supabaseClient
-      .from("payouts")
-      .update({
-        status: "completed",
-        completed_at: new Date().toISOString(),
-        notes: `Transfer ID: ${transfer.id}`,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", payout_id);
+      // 2. Transfer to ORGANIZATION (if applicable)
+      let orgTransferId = null;
+      const orgFee = payout.purchase?.org_fee || 0;
+      const orgStripeAccountId = payout.purchase?.tickets?.organizations?.stripe_account_id;
 
-    if (completeError) {
-      console.error("Error completing payout:", completeError);
-    }
+      if (orgFee > 0 && orgStripeAccountId) {
+        const orgTransfer = await stripe.transfers.create({
+          amount: orgFee,
+          currency: "usd",
+          destination: orgStripeAccountId,
+          description: `Organization commission`,
+          metadata: {
+            payout_id: payout.id,
+            organization_id: payout.purchase?.tickets?.organizations?.id,
+            type: "org_commission",
+          },
+        }, {
+          idempotencyKey: `org_payout_${payout.id}`,
+        });
 
-    // Deduct from wallet
-    const { data: wallet } = await supabaseClient
-      .from("wallets")
-      .select("balance")
-      .eq("user_id", payout.user_id)
-      .single();
+        orgTransferId = orgTransfer.id;
 
-    if (wallet) {
+        // Record org payout
+        await supabaseClient
+          .from("stripe_payouts")
+          .insert({
+            stripe_transfer_id: orgTransfer.id,
+            organization_id: payout.purchase?.tickets?.organizations?.id,
+            payout_id: payout.id,
+            amount: orgFee,
+            currency: "USD",
+            status: "completed",
+            payout_type: "organization",
+            admin_approved: true,
+            approved_by: user.id,
+            approved_at: new Date().toISOString(),
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          });
+      }
+
+      // Update payout as completed
+      await supabaseClient
+        .from("payouts")
+        .update({
+          status: "completed",
+          completed_at: new Date().toISOString(),
+          notes: `Seller transfer: ${sellerTransfer.id}${orgTransferId ? `, Org transfer: ${orgTransferId}` : ""}`,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", payout_id);
+
+      // Deduct from wallet
       const newBalance = wallet.balance - payout.amount;
       await supabaseClient
         .from("wallets")
@@ -225,20 +315,50 @@ serve(async (req) => {
           reference_id: payout.id,
           reference_type: "payout",
           description: `Payout to Stripe account`,
+          created_at: new Date().toISOString(),
         });
+
+      // Update ticket status to payout_completed
+      if (payout.purchase?.ticket_id) {
+        await supabaseClient
+          .from("tickets")
+          .update({
+            status: "payout_completed",
+            payout_completed_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", payout.purchase.ticket_id);
+      }
+
+      return new Response(
+        JSON.stringify({
+          success: true,
+          seller_transfer_id: sellerTransfer.id,
+          org_transfer_id: orgTransferId,
+          status: "completed",
+        }),
+        {
+          status: 200,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
+
+    } catch (stripeError: unknown) {
+      console.error("Stripe transfer failed:", stripeError);
+
+      // Revert payout status
+      await supabaseClient
+        .from("payouts")
+        .update({
+          status: "failed",
+          notes: `Transfer failed: ${stripeError instanceof Error ? stripeError.message : "Unknown error"}`,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", payout_id);
+
+      throw stripeError;
     }
 
-    return new Response(
-      JSON.stringify({
-        success: true,
-        transfer_id: transfer.id,
-        status: "completed",
-      }),
-      {
-        status: 200,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      }
-    );
   } catch (error: unknown) {
     console.error("Error in execute-payout:", error);
     const message = error instanceof Error ? error.message : "Internal server error";

@@ -23,6 +23,7 @@ import ComingSoon from "./pages/ComingSoon";
 import CasinoDashboard from "./pages/CasinoDashboard";
 import HowItWorks from "./pages/HowItWorks";
 import UseCases from "./pages/UseCases";
+import SellerOnboard from "@/pages/SellerOnboard";
 import About from "./pages/About";
 import Contact from "./pages/Contact";
 import Terms from "./pages/Terms";
@@ -37,7 +38,7 @@ const queryClient = new QueryClient();
 
 // Toggle this to show/hide the coming soon page
 // Set to true to show coming soon page, false to show full app
-const SHOW_COMING_SOON = true;
+const SHOW_COMING_SOON = false;
 
 const App = () => {
   // If in coming soon mode, show only the coming soon page
@@ -95,7 +96,8 @@ const App = () => {
                   <CasinoDashboard />
                 </AdminRoute>
               } />
-              <Route path="/seller-dashboard" element={<SellerDashboard />} />
+              {/* <Route path="/seller-dashboard" element={<SellerDashboard />} /> */}
+              <Route path="/seller-dashboard" element={<SellerOnboard />} />
               <Route path="/ticket-history" element={<TicketHistory />} />
               <Route path="/order/:purchaseId" element={<OrderDetail />} />
               <Route path="/account" element={<MyAccount />} />
