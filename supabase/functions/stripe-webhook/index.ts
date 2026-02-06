@@ -1,6 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import Stripe from "https://esm.sh/stripe@14.21.0";
+import Stripe from "https://esm.sh/stripe@14.21.0?target=deno";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -22,8 +22,10 @@ serve(async (req) => {
     return new Response("Server configuration error", { status: 500 });
   }
 
+  // ✅ Add httpClient for Deno compatibility
   const stripe = new Stripe(stripeSecretKey, {
     apiVersion: "2023-10-16",
+    httpClient: Stripe.createFetchHttpClient(),
   });
 
   const supabaseClient = createClient(supabaseUrl, supabaseServiceKey);
@@ -37,7 +39,14 @@ serve(async (req) => {
   const body = await req.text();
 
   try {
-    event = stripe.webhooks.constructEvent(body, signature, webhookSecret);
+    // ✅ Use SubtleCryptoProvider for Deno
+    event = await stripe.webhooks.constructEventAsync(
+      body,
+      signature,
+      webhookSecret,
+      undefined,
+      Stripe.createSubtleCryptoProvider()
+    );
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Unknown error";
     console.error("Webhook signature verification failed:", message);
@@ -56,7 +65,13 @@ serve(async (req) => {
 
       case "checkout.session.completed": {
         const session = event.data.object as Stripe.Checkout.Session;
-        await handleCheckoutCompleted(supabaseClient, stripe, session);
+        await handleCheckoutCompleted(supabaseClient, session);
+        break;
+      }
+
+      case "checkout.session.expired": {
+        const session = event.data.object as Stripe.Checkout.Session;
+        await handleCheckoutExpired(supabaseClient, session);
         break;
       }
 
@@ -72,15 +87,15 @@ serve(async (req) => {
         break;
       }
 
-      case "payout.paid": {
-        const payout = event.data.object as Stripe.Payout;
-        await handlePayoutPaid(supabaseClient, payout);
+      case "charge.refunded": {
+        const charge = event.data.object as Stripe.Charge;
+        await handleChargeRefunded(supabaseClient, charge);
         break;
       }
 
-      case "payout.failed": {
-        const payout = event.data.object as Stripe.Payout;
-        await handlePayoutFailed(supabaseClient, payout);
+      case "charge.dispute.created": {
+        const dispute = event.data.object as Stripe.Dispute;
+        await handleDisputeCreated(supabaseClient, dispute);
         break;
       }
 
@@ -93,6 +108,18 @@ serve(async (req) => {
       case "transfer.failed": {
         const transfer = event.data.object as Stripe.Transfer;
         await handleTransferFailed(supabaseClient, transfer);
+        break;
+      }
+
+      case "payout.paid": {
+        const payout = event.data.object as Stripe.Payout;
+        await handlePayoutPaid(supabaseClient, payout);
+        break;
+      }
+
+      case "payout.failed": {
+        const payout = event.data.object as Stripe.Payout;
+        await handlePayoutFailed(supabaseClient, payout);
         break;
       }
 
@@ -113,13 +140,16 @@ serve(async (req) => {
   }
 });
 
+// ============ HANDLER FUNCTIONS ============
+
 async function handleAccountUpdated(supabaseClient: any, account: Stripe.Account) {
   console.log(`Processing account.updated for ${account.id}`);
 
-  // Determine onboarding status
   let onboardingStatus = "pending";
-  if (account.details_submitted && account.charges_enabled) {
+  if (account.details_submitted && account.charges_enabled && account.payouts_enabled) {
     onboardingStatus = "complete";
+  } else if (account.details_submitted && account.charges_enabled) {
+    onboardingStatus = "pending_payouts";
   } else if (account.details_submitted) {
     onboardingStatus = "pending_verification";
   } else if (account.requirements?.currently_due?.length === 0) {
@@ -146,7 +176,6 @@ async function handleAccountUpdated(supabaseClient: any, account: Stripe.Account
 
 async function handleCheckoutCompleted(
   supabaseClient: any,
-  stripe: Stripe,
   session: Stripe.Checkout.Session
 ) {
   console.log(`Processing checkout.session.completed for ${session.id}`);
@@ -154,15 +183,28 @@ async function handleCheckoutCompleted(
   const metadata = session.metadata || {};
   const ticketId = metadata.ticket_id;
   const buyerId = metadata.buyer_id;
+  const sellerId = metadata.seller_id;
 
   if (!ticketId || !buyerId) {
     console.error("Missing ticket_id or buyer_id in session metadata");
     return;
   }
 
-  // Update stripe_payments record
+  // Idempotency check
+  const { data: existingPurchase } = await supabaseClient
+    .from("purchases")
+    .select("id")
+    .eq("stripe_session_id", session.id)
+    .maybeSingle();
+
+  if (existingPurchase) {
+    console.log(`Session ${session.id} already processed, skipping`);
+    return;
+  }
+
   const paymentIntentId = session.payment_intent as string;
 
+  // Update stripe_payments record
   const { error: paymentError } = await supabaseClient
     .from("stripe_payments")
     .update({
@@ -176,22 +218,34 @@ async function handleCheckoutCompleted(
     console.error("Error updating payment record:", paymentError);
   }
 
-  // Create purchase record
+  // Parse amounts from metadata
   const ticketPrice = parseInt(metadata.ticket_price || "0");
-  const serviceFee = parseInt(metadata.service_fee || "0");
+  const platformFee = parseInt(metadata.platform_fee || "0");
+  const orgFee = parseInt(metadata.org_fee || "0");
+  const sellerNet = parseInt(metadata.seller_net || "0");
+  const totalAmount = parseInt(metadata.total_amount || "0");
 
+  // Create purchase record
   const { error: purchaseError } = await supabaseClient
     .from("purchases")
     .insert({
       ticket_id: ticketId,
       buyer_id: buyerId,
+      seller_id: sellerId,
+      stripe_session_id: session.id,
+      stripe_payment_intent_id: paymentIntentId,
       ticket_price: ticketPrice,
-      service_fee: serviceFee,
-      total_amount: ticketPrice + serviceFee,
+      platform_fee: platformFee,
+      org_fee: orgFee,
+      seller_net: sellerNet,
+      total_amount: totalAmount,
       buyer_first_name: metadata.buyer_first_name || null,
       buyer_last_name: metadata.buyer_last_name || null,
       buyer_dob: metadata.buyer_dob || null,
       buyer_casino_alias: metadata.buyer_casino_alias || null,
+      status: "pending_org_approval", // Waiting for org approval
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
     });
 
   if (purchaseError) {
@@ -199,7 +253,94 @@ async function handleCheckoutCompleted(
     throw purchaseError;
   }
 
-  console.log(`Checkout completed for ticket ${ticketId}`);
+  // Update ticket status to pending organization approval
+  const { error: ticketError } = await supabaseClient
+    .from("tickets")
+    .update({
+      status: "pending_org_approval",
+      buyer_id: buyerId,
+      payment_completed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", ticketId);
+
+  if (ticketError) {
+    console.error("Error updating ticket status:", ticketError);
+    throw ticketError;
+  }
+
+  // Credit seller's wallet (held until payout approved)
+  const { data: wallet } = await supabaseClient
+    .from("wallets")
+    .select("id, balance, pending_balance")
+    .eq("user_id", sellerId)
+    .maybeSingle();
+
+  if (wallet) {
+    await supabaseClient
+      .from("wallets")
+      .update({
+        pending_balance: (wallet.pending_balance || 0) + sellerNet,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", wallet.id);
+  } else {
+    // Create wallet if doesn't exist
+    await supabaseClient
+      .from("wallets")
+      .insert({
+        user_id: sellerId,
+        balance: 0,
+        pending_balance: sellerNet,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+  }
+
+  console.log(`Checkout completed for ticket ${ticketId}, pending org approval`);
+}
+
+async function handleCheckoutExpired(supabaseClient: any, session: Stripe.Checkout.Session) {
+  console.log(`Processing checkout.session.expired for ${session.id}`);
+
+  const metadata = session.metadata || {};
+  const ticketId = metadata.ticket_id;
+
+  if (!ticketId) {
+    console.log("No ticket_id in expired session metadata");
+    return;
+  }
+
+  // Revert ticket to available
+  const { error: ticketError } = await supabaseClient
+    .from("tickets")
+    .update({
+      status: "available",
+      pending_buyer_id: null,
+      pending_at: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", ticketId)
+    .eq("status", "pending");
+
+  if (ticketError) {
+    console.error("Error reverting ticket status:", ticketError);
+  }
+
+  // Update payment record
+  const { error: paymentError } = await supabaseClient
+    .from("stripe_payments")
+    .update({
+      status: "expired",
+      updated_at: new Date().toISOString(),
+    })
+    .eq("checkout_session_id", session.id);
+
+  if (paymentError) {
+    console.log("No payment record found for expired session");
+  }
+
+  console.log(`Ticket ${ticketId} reverted to available after checkout expiry`);
 }
 
 async function handlePaymentSucceeded(supabaseClient: any, paymentIntent: Stripe.PaymentIntent) {
@@ -215,22 +356,19 @@ async function handlePaymentSucceeded(supabaseClient: any, paymentIntent: Stripe
 
   if (error) {
     console.error("Error updating payment status:", error);
-    throw error;
   }
 }
 
 async function handlePaymentFailed(supabaseClient: any, paymentIntent: Stripe.PaymentIntent) {
   console.log(`Processing payment_intent.payment_failed for ${paymentIntent.id}`);
 
-  // Get the payment record to find the ticket
   const { data: payment } = await supabaseClient
     .from("stripe_payments")
     .select("ticket_id")
     .eq("payment_intent_id", paymentIntent.id)
     .maybeSingle();
 
-  // Update payment status
-  const { error: paymentError } = await supabaseClient
+  await supabaseClient
     .from("stripe_payments")
     .update({
       status: "failed",
@@ -238,54 +376,144 @@ async function handlePaymentFailed(supabaseClient: any, paymentIntent: Stripe.Pa
     })
     .eq("payment_intent_id", paymentIntent.id);
 
-  if (paymentError) {
-    console.error("Error updating payment status:", paymentError);
-  }
-
-  // Revert ticket to available
   if (payment?.ticket_id) {
-    const { error: ticketError } = await supabaseClient
+    await supabaseClient
       .from("tickets")
       .update({
         status: "available",
+        pending_buyer_id: null,
+        pending_at: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", payment.ticket_id);
+  }
+}
+
+async function handleChargeRefunded(supabaseClient: any, charge: Stripe.Charge) {
+  console.log(`Processing charge.refunded for ${charge.id}`);
+
+  const paymentIntentId = charge.payment_intent as string;
+
+  const { data: payment } = await supabaseClient
+    .from("stripe_payments")
+    .select("ticket_id, seller_id, seller_net")
+    .eq("payment_intent_id", paymentIntentId)
+    .maybeSingle();
+
+  if (!payment) {
+    console.error("Payment not found for refund:", paymentIntentId);
+    return;
+  }
+
+  // Update payment status
+  await supabaseClient
+    .from("stripe_payments")
+    .update({
+      status: "refunded",
+      refunded_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("payment_intent_id", paymentIntentId);
+
+  // Update ticket back to available
+  await supabaseClient
+    .from("tickets")
+    .update({
+      status: "available",
+      buyer_id: null,
+      pending_buyer_id: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", payment.ticket_id);
+
+  // Update purchase record
+  await supabaseClient
+    .from("purchases")
+    .update({
+      status: "refunded",
+      refunded_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("ticket_id", payment.ticket_id);
+
+  // Deduct from seller's pending balance
+  if (payment.seller_id && payment.seller_net) {
+    const { data: wallet } = await supabaseClient
+      .from("wallets")
+      .select("id, pending_balance")
+      .eq("user_id", payment.seller_id)
+      .maybeSingle();
+
+    if (wallet) {
+      await supabaseClient
+        .from("wallets")
+        .update({
+          pending_balance: Math.max(0, (wallet.pending_balance || 0) - payment.seller_net),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", wallet.id);
+    }
+  }
+
+  console.log(`Refund processed for ticket ${payment.ticket_id}`);
+}
+
+async function handleDisputeCreated(supabaseClient: any, dispute: Stripe.Dispute) {
+  console.log(`Processing charge.dispute.created for ${dispute.id}`);
+
+  const paymentIntentId = dispute.payment_intent as string;
+
+  await supabaseClient
+    .from("stripe_payments")
+    .update({
+      status: "disputed",
+      dispute_id: dispute.id,
+      disputed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("payment_intent_id", paymentIntentId);
+
+  // Get ticket and update status
+  const { data: payment } = await supabaseClient
+    .from("stripe_payments")
+    .select("ticket_id")
+    .eq("payment_intent_id", paymentIntentId)
+    .maybeSingle();
+
+  if (payment?.ticket_id) {
+    await supabaseClient
+      .from("tickets")
+      .update({
+        status: "disputed",
         updated_at: new Date().toISOString(),
       })
       .eq("id", payment.ticket_id);
 
-    if (ticketError) {
-      console.error("Error reverting ticket status:", ticketError);
-    }
+    await supabaseClient
+      .from("purchases")
+      .update({
+        status: "disputed",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("ticket_id", payment.ticket_id);
   }
-}
 
-async function handlePayoutPaid(supabaseClient: any, payout: Stripe.Payout) {
-  console.log(`Processing payout.paid for ${payout.id}`);
-
-  // Note: Stripe payouts are different from our transfers to connected accounts
-  // This handles payouts FROM connected accounts to their bank accounts
-  // We track transfers separately in stripe_payouts table
-}
-
-async function handlePayoutFailed(supabaseClient: any, payout: Stripe.Payout) {
-  console.log(`Processing payout.failed for ${payout.id}`);
-
-  // Note: Similar to payout.paid, this is for connected account payouts to banks
+  console.log(`Dispute created for payment ${paymentIntentId}`);
 }
 
 async function handleTransferCreated(supabaseClient: any, transfer: Stripe.Transfer) {
   console.log(`Processing transfer.created for ${transfer.id}`);
 
-  // Update stripe_payouts record with transfer ID
   const { error } = await supabaseClient
     .from("stripe_payouts")
     .update({
       status: "completed",
+      transfer_completed_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     })
     .eq("stripe_transfer_id", transfer.id);
 
   if (error) {
-    // Transfer might not be in our system yet, that's okay
     console.log("Transfer not found in stripe_payouts:", transfer.id);
   }
 }
@@ -304,4 +532,15 @@ async function handleTransferFailed(supabaseClient: any, transfer: Stripe.Transf
   if (error) {
     console.error("Error updating payout status:", error);
   }
+}
+
+async function handlePayoutPaid(supabaseClient: any, payout: Stripe.Payout) {
+  console.log(`Processing payout.paid for ${payout.id}`);
+  // This is for connected account payouts to their bank
+  // Usually handled separately
+}
+
+async function handlePayoutFailed(supabaseClient: any, payout: Stripe.Payout) {
+  console.log(`Processing payout.failed for ${payout.id}`);
+  // This is for connected account payouts to their bank
 }

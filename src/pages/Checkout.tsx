@@ -11,18 +11,9 @@ import { useToast } from "@/hooks/use-toast";
 import { MapPin, Calendar as CalendarIcon, DollarSign, Trophy, Loader2, User, Info } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { DobSelect } from "@/components/DobSelect";
-import { sendPurchaseConfirmation } from "@/hooks/useTransactionalEmail";
-import axios from "axios";
-import StripeCardForm from "@/components/StripeCardForm";
 
-const MARKETPLACE_FEE_PERCENTAGE = 5; // 5% service fee
-const STRIPE_API_BASE = "http://localhost:5000"; // backend URL
-
-interface StripeAccountRow {
-  stripe_account_id: string | null;
-  charges_enabled: boolean | null;
-  payouts_enabled: boolean | null;
-}
+// Match backend fee percentage
+const MARKETPLACE_FEE_PERCENTAGE = 8;
 
 interface Ticket {
   id: string;
@@ -38,16 +29,9 @@ interface Ticket {
 
 interface TicketWithSeller extends Ticket {
   seller_username: string | null;
-
   seller_stripe_account_id: string | null;
   seller_charges_enabled: boolean | null;
   seller_payouts_enabled: boolean | null;
-}
-
-
-
-interface CheckoutUser {
-  id: string;
 }
 
 interface BuyerInfo {
@@ -66,7 +50,7 @@ const Checkout = () => {
   const [ticket, setTicket] = useState<TicketWithSeller | null>(null);
   const [loading, setLoading] = useState(true);
   const [processing, setProcessing] = useState(false);
-  const [user, setUser] = useState<CheckoutUser | null>(null);
+  const [user, setUser] = useState<{ id: string } | null>(null);
   const [buyerInfo, setBuyerInfo] = useState<BuyerInfo>({
     firstName: "",
     lastName: "",
@@ -75,8 +59,21 @@ const Checkout = () => {
     dobMonth: "",
     dobYear: "",
   });
-  const [clientSecret, setClientSecret] = useState<string | null>(null);
 
+  // Check for canceled checkout
+  useEffect(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.get("canceled") === "true") {
+      toast({
+        title: "Checkout Canceled",
+        description: "Your purchase was not completed. The ticket is still available.",
+      });
+      // Clean URL
+      window.history.replaceState({}, "", `/checkout/${ticketId}`);
+    }
+  }, [ticketId, toast]);
+
+  // Auth check
   useEffect(() => {
     const checkAuth = async () => {
       const { data: { user } } = await supabase.auth.getUser();
@@ -107,6 +104,7 @@ const Checkout = () => {
     checkAuth();
   }, [navigate]);
 
+  // Fetch ticket
   useEffect(() => {
     const fetchTicket = async () => {
       if (!ticketId) {
@@ -120,7 +118,7 @@ const Checkout = () => {
       }
 
       try {
-        // 1️⃣ Fetch ticket
+        // Fetch ticket
         const { data: ticketData, error: ticketError } = await supabase
           .from("tickets")
           .select("*")
@@ -140,44 +138,60 @@ const Checkout = () => {
           return;
         }
 
-        // 2️⃣ Fetch seller profile
-        const { data: profileData, error: profileError } = await supabase
+        // Fetch seller profile
+        const { data: profileData } = await supabase
           .from("profiles")
           .select("username")
           .eq("id", ticketData.seller_id)
           .maybeSingle();
 
-        if (profileError) throw profileError;
-
-        // 🔴 Cast supabase to any to avoid TS infinite type recursion
-        const supabaseAny = supabase as any;
-
-        const { data: stripeData, error: stripeError } = await supabaseAny
+        // Fetch seller's Stripe account
+        const { data: stripeData, error: stripeError } = await supabase
           .from("stripe_accounts")
           .select("stripe_account_id, charges_enabled, payouts_enabled")
           .eq("user_id", ticketData.seller_id)
+          .eq("account_type", "seller")
           .maybeSingle();
 
+        console.log("=== DEBUG CHECKOUT ===");
+        console.log("Ticket ID:", ticketId);
+        console.log("Ticket Seller ID:", ticketData.seller_id);
+        console.log("Stripe Data:", stripeData);
+        console.log("Stripe Error:", stripeError);
+        console.log("======================");
 
-        if (stripeError) throw stripeError;
+        // ✅ CHECK SELLER STRIPE STATUS HERE
+        if (!stripeData?.stripe_account_id) {
+          toast({
+            title: "Seller Not Ready",
+            description: "This seller hasn't connected their payment account yet.",
+            variant: "destructive",
+          });
+          navigate(-1);
+          return;
+        }
 
-        // 4️⃣ Combine everything safely
+        if (!stripeData.charges_enabled || !stripeData.payouts_enabled) {
+          toast({
+            title: "Seller Not Ready",
+            description: "This seller hasn't completed their payment setup. Please try another ticket.",
+            variant: "destructive",
+          });
+          navigate(-1);
+          return;
+        }
+
+        // ✅ Only set ticket if seller is ready
         setTicket({
           ...ticketData,
           seller_username: profileData?.username ?? null,
-
-          seller_stripe_account_id: stripeData?.stripe_account_id ?? null,
-          seller_charges_enabled: stripeData?.charges_enabled ?? null,
-          seller_payouts_enabled: stripeData?.payouts_enabled ?? null,
+          seller_stripe_account_id: stripeData.stripe_account_id,
+          seller_charges_enabled: stripeData.charges_enabled,
+          seller_payouts_enabled: stripeData.payouts_enabled,
         });
 
-
-        console.log("Profiles loaded:", profileData);
-        console.log("Checkout ticket loaded:", stripeData);
-
-
       } catch (error: any) {
-        console.error("Error loading ticket in checkout:", error);
+        console.error("Error loading ticket:", error);
         toast({
           title: "Error",
           description: "Failed to load ticket. Please try again.",
@@ -192,6 +206,23 @@ const Checkout = () => {
     fetchTicket();
   }, [ticketId, navigate, toast]);
 
+
+  // // Validate seller can receive payments
+  // useEffect(() => {
+  //   // Only check if ticket is loaded AND we have Stripe data
+  //   if (
+  //     ticket &&
+  //     ticket.seller_stripe_account_id !== null && // Stripe account exists
+  //     (!ticket.seller_charges_enabled || !ticket.seller_payouts_enabled)
+  //   ) {
+  //     toast({
+  //       title: "Seller Not Ready",
+  //       description: "This seller hasn't completed their payment setup. Please try another ticket.",
+  //       variant: "destructive",
+  //     });
+  //     navigate("/browse");
+  //   }
+  // }, [ticket, navigate, toast]);
 
   const handlePurchase = async () => {
     if (!user || !ticket) return;
@@ -222,54 +253,45 @@ const Checkout = () => {
       return;
     }
 
+    // Validate seller can receive payments
+    if (!ticket.seller_charges_enabled || !ticket.seller_payouts_enabled) {
+      toast({
+        title: "Seller Not Ready",
+        description: "This seller hasn't completed payment setup.",
+        variant: "destructive",
+      });
+      return;
+    }
+
     setProcessing(true);
 
     try {
-      const session = await supabase.auth.getSession();
-      const token = session.data.session?.access_token;
-
-      console.log("Ticket data: ", {
-        ticket_id: ticket.id,
-        buyer_info: {
-          first_name: buyerInfo.firstName,
-          last_name: buyerInfo.lastName,
-          dob: `${buyerInfo.dobYear}-${buyerInfo.dobMonth}-${buyerInfo.dobDay}`,
-          casino_alias: buyerInfo.casinoAlias,
-        },
-      })
-
-      const res = await fetch(
-        "https://wfjdbsusmplusovtytqf.supabase.co/functions/v1/create-checkout-session",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
+      // Use Supabase functions.invoke
+      const { data, error } = await supabase.functions.invoke("create-checkout-session", {
+        body: {
+          ticket_id: ticket.id,
+          buyer_info: {
+            first_name: buyerInfo.firstName.trim(),
+            last_name: buyerInfo.lastName.trim(),
+            dob: `${buyerInfo.dobYear}-${buyerInfo.dobMonth}-${buyerInfo.dobDay}`,
+            casino_alias: buyerInfo.casinoAlias.trim() || null,
           },
-          body: JSON.stringify({
-            ticket_id: ticket.id,
-            buyer_info: {
-              first_name: buyerInfo.firstName,
-              last_name: buyerInfo.lastName,
-              dob: `${buyerInfo.dobYear}-${buyerInfo.dobMonth}-${buyerInfo.dobDay}`,
-              casino_alias: buyerInfo.casinoAlias,
-            },
-          }),
-        }
-      );
+        },
+      });
 
-      const data = await res.json();
-
-      console.log(data);
-      if (!res.ok) {
-        throw new Error(data.error || "Failed to create checkout session");
+      if (error) {
+        throw new Error(error.message);
       }
 
-      // 🔴 Redirect to Stripe Checkout
+      if (!data?.url) {
+        throw new Error("No checkout URL received");
+      }
+
+      // Redirect to Stripe Checkout
       window.location.href = data.url;
 
     } catch (error: any) {
-      console.error(error);
+      console.error("Checkout error:", error);
       toast({
         title: "Purchase Failed",
         description: error.message || "Something went wrong. Please try again.",
@@ -278,57 +300,7 @@ const Checkout = () => {
     } finally {
       setProcessing(false);
     }
-  }
-
-
-
-  const handlePaymentSuccess = async () => {
-    if (!user || !ticket) return;
-
-    try {
-      const ticketPrice = ticket.asking_price;
-      const serviceFee = Math.round(ticketPrice * (MARKETPLACE_FEE_PERCENTAGE / 100));
-      const totalAmount = ticketPrice + serviceFee;
-
-
-      // Insert purchase ONLY after payment success
-      const { error: purchaseError } = await supabase
-        .from("purchases")
-        .insert({
-          ticket_id: ticket.id,
-          buyer_id: user.id,
-          ticket_price: ticketPrice,
-          service_fee: serviceFee,
-          total_amount: totalAmount,
-          buyer_first_name: buyerInfo.firstName.trim(),
-          buyer_last_name: buyerInfo.lastName.trim(),
-          buyer_casino_alias: buyerInfo.casinoAlias.trim() || null,
-          buyer_dob:
-            buyerInfo.dobDay && buyerInfo.dobMonth && buyerInfo.dobYear
-              ? `${buyerInfo.dobYear}-${buyerInfo.dobMonth}-${buyerInfo.dobDay}`
-              : null,
-        });
-
-      if (purchaseError) {
-        throw purchaseError;
-      }
-
-      toast({
-        title: "Payment Successful!",
-        description:
-          "Your purchase is pending venue verification. You’ll be notified once approved.",
-      });
-
-      navigate("/browse");
-    } catch (error: any) {
-      toast({
-        title: "Finalization Failed",
-        description: error.message || "Payment succeeded but order failed.",
-        variant: "destructive",
-      });
-    }
   };
-
 
   if (loading) {
     return (
@@ -348,7 +320,7 @@ const Checkout = () => {
   const buyInDollars = ticket.buy_in / 100;
   const moneyGuaranteeDollars = ticket.money_guarantee ? ticket.money_guarantee / 100 : null;
 
-  // Calculate fee from cents to avoid rounding drift
+  // Calculate fee from cents
   const serviceFeeCents = Math.round(ticket.asking_price * (MARKETPLACE_FEE_PERCENTAGE / 100));
   const totalAmountCents = ticket.asking_price + serviceFeeCents;
 
@@ -383,10 +355,10 @@ const Checkout = () => {
               <div className="flex items-center gap-3">
                 <CalendarIcon className="h-5 w-5 text-muted-foreground shrink-0" />
                 <span className="text-sm text-muted-foreground">
-                  {new Date(ticket.event_date).toLocaleDateString('en-US', {
-                    year: 'numeric',
-                    month: 'long',
-                    day: 'numeric'
+                  {new Date(ticket.event_date).toLocaleDateString("en-US", {
+                    year: "numeric",
+                    month: "long",
+                    day: "numeric",
                   })}
                 </span>
               </div>
@@ -422,7 +394,6 @@ const Checkout = () => {
                 size="sm"
                 className="w-full"
                 onClick={() => {
-                  // TODO: Implement contact support functionality
                   toast({
                     title: "Contact Support",
                     description: "Support feature coming soon!",
@@ -516,12 +487,12 @@ const Checkout = () => {
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <span className="text-muted-foreground flex items-center gap-1 cursor-help">
-                          Marketplace Service Fee ({MARKETPLACE_FEE_PERCENTAGE}%)
+                          Service Fee ({MARKETPLACE_FEE_PERCENTAGE}%)
                           <Info className="h-3.5 w-3.5" />
                         </span>
                       </TooltipTrigger>
                       <TooltipContent side="top" className="max-w-xs text-sm">
-                        <p>This fee helps us keep the platform running — covering secure hosting, customer support, payment processing, and ongoing development to bring you the best experience.</p>
+                        <p>This fee helps us keep the platform running — covering secure hosting, customer support, payment processing, and ongoing development.</p>
                       </TooltipContent>
                     </Tooltip>
                   </TooltipProvider>
@@ -561,22 +532,13 @@ const Checkout = () => {
               </Button>
 
               <p className="text-xs text-muted-foreground text-center mt-4">
-                By completing this purchase, you agree to our <a href="/terms" target="_blank" className="text-primary hover:underline">Terms & Conditions</a>.
+                By completing this purchase, you agree to our{" "}
+                <a href="/terms" target="_blank" className="text-primary hover:underline">
+                  Terms & Conditions
+                </a>
+                .
               </p>
             </Card>
-            {/* 
-            {clientSecret && (
-              <StripeCardForm
-                clientSecret={clientSecret}
-                onSuccess={() => {
-                  toast({
-                    title: "Payment Successful",
-                    description: "Your payment was completed successfully.",
-                  });
-                }}
-              />
-            )} */}
-
           </div>
         </div>
       </main>

@@ -14,15 +14,13 @@ dist-ssr
 coverage
 .cache
 .tmp
+backend
 
 # Environment variables
-.env
-.env.*
 !.env.example
 *.local
 
 # Editor directories and files
-.vscode/*
 !.vscode/extensions.json
 .idea
 .DS_Store
@@ -32,3 +30,7 @@ coverage
 *.sln
 *.sw?
 .eslintcache
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+config.bat
